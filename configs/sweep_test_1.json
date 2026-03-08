@@ -1,0 +1,26 @@
+{
+  "seeds": [0],
+  "model_configs": [
+    {"d_model": 256, "n_heads": 8, "num_layers": 4, "dropout": 0},
+    {"d_model": 512, "n_heads": 8, "num_layers": 8, "dropout": 0},
+    {"d_model": 512, "n_heads": 8, "num_layers": 16, "dropout": 0}
+  ],
+  "train": {
+    "max_steps": 100000,
+    "eval_every": 5000,
+    "scheduler": "warmup_cosine",
+    "batch_size": 16,
+    "eval_batch_size": 32,
+    "lr": 5e-5,
+    "weight_decay": 1e-6,
+    "max_lr": 1e-4,
+    "num_workers": 4,
+    "val_max_size": null,
+    "max_eval_batches": 500,
+    "max_train_samples": null,
+    "include_val_in_train": false,
+    "sharpness_n_batches": 100,
+    "sharpness_eps": 1e-3,
+    "sharpness_relative_eps": true
+  }
+}
