@@ -1,6 +1,6 @@
 # Pipeline: ASR on LibriSpeech (Conformer + CTC)
 
-Training and evaluation of a Conformer-CTC model on LibriSpeech (clean). The pipeline supports experiments on overparameterization, double descent, regularization, and label noise.
+Trains and evaluates a Conformer-CTC model on LibriSpeech clean. Experiments cover overparameterization, double descent, regularization, and label noise.
 
 ---
 
@@ -170,7 +170,7 @@ With `--output_dir`: on each eval `checkpoint_step_{step}.pth` is saved; when te
 
 ### 4.2. `sweep_run.py`
 
-Multiple runs: reads JSON with `seeds`, `model_configs`, `train` -> for each (seed, model_config) computes `run_id` (hash of seed + model_config + train); if run_id already in results, skips -> otherwise loads data with that seed, runs `run_training`, appends a record to the results list and saves the JSON.
+Multiple runs: reads JSON with `seeds`, `model_configs`, `train`; for each (seed, model_config) computes `run_id` (hash of seed + model_config + train); skips if run_id already in results; otherwise loads data with that seed, runs `run_training`, appends to results, and saves the JSON.
 
 **Arguments:**
 
@@ -218,7 +218,7 @@ Multiple runs: reads JSON with `seeds`, `model_configs`, `train` -> for each (se
 }
 ```
 
-All keys under `train` are passed to `load_librispeech` and `run_training`; they affect `run_id`, so different label-noise or data settings yield different runs and do not mix in one report.
+All keys under `train` are passed to `load_librispeech` and `run_training`; they affect `run_id`, so different label-noise or data settings produce separate run IDs and never share results.
 
 ---
 
@@ -227,7 +227,7 @@ All keys under `train` are passed to `load_librispeech` and `run_training`; they
 - **`utils.py`**: `train_one_step` (forward, CTC, backward, AMP; returns loss, did_step, skip_reason), `evaluate_dataloader` (loss + WER with optional keep mask), `sharpness_proxy` (one-sided, K perturbations per batch, on-device perturb/restore), `weight_norm_sum`, `WarmupCosineScheduler`, `compute_wer`.
 - **`conformer.py`**: ConformerCTC architecture; input 80 mel, output logits over vocabulary.
 - **`dataset.py`**: Text normalization for SPM (e.g. lowercasing, stripping extra spaces).
-- **`train_spm.py`**: Trains a SentencePiece unigram model from LibriSpeech transcripts (used to produce `spm_unigram.model` / `spm_unigram.vocab`).
+- **`train_spm.py`**: Trains a SentencePiece unigram model from LibriSpeech transcripts; outputs `spm_unigram.model` and `spm_unigram.vocab`.
 - **`plot_stage_a.py`**: Plots double-descent / generalization curves from sweep output JSONs (Stage A experiments varying model depth).
 - **`plot_cmvn_comparison.py`**: Compares training curves across CMVN modes (`none`, `utt`, `global`) from their respective sweep output JSONs.
 
@@ -252,9 +252,9 @@ All keys under `train` are passed to `load_librispeech` and `run_training`; they
 
 - **Steps vs iterations**: Counting is by actual optimizer steps; on AMP overflow or keep.sum()==0 the step is not taken but the batch is consumed - reflected in iters_per_opt_step and skipped_*.
 - **Keep mask**: When `use_keep_mask=False` (default), the `out_lengths >= target_lengths` filter is not applied; `CTCLoss(zero_infinity=True)` handles invalid sequences silently and avoids the GPU→CPU sync. Enable with `--keep_mask` if explicit filtering is needed.
-- **Validation eval**: `val_dl` is passed to `run_training` when `include_val_in_train=False`; Stage A passes `val_dl=None` to avoid any data leakage from the validation set during training.
+- **Validation eval**: `val_dl` is passed to `run_training` when `include_val_in_train=False`; Stage A passes `val_dl=None` to keep val out of training.
 - **Reproducibility**: Set seed in load_librispeech (shuffle, workers) and in run_training (torch/np/random); for static noise use label_noise_seed; for runtime use rt_noise_seed when set.
-- **Stage A**: Default `include_val_in_train=False` and `val_dl` passed through from train.py only when val is not merged into train.
+- **Stage A**: `include_val_in_train=False` by default; `train.py` passes `val_dl` only when val is separate from train.
 
 ---
 
@@ -265,7 +265,7 @@ All configs are JSON files consumed by `sweep_run.py`. Each defines `seeds`, `mo
 | Config file | Purpose |
 |-------------|---------|
 | `sweep_full.json` | **Stage A baseline**: 8 model depths (num_layers 1–16), 2 seeds, full train set, `cmvn_mode="utt"`. Used to study double descent vs model size. |
-| `sweep_full_seed_0.json` | Same as `sweep_full.json` but single seed (0). Useful for a quick single-seed run. |
+| `sweep_full_seed_0.json` | Same as `sweep_full.json` but single seed (0). |
 | `sweep_subset_5k.json` | Stage A on a **5k-sample subset**: same 8 depths, 2 seeds, `max_train_samples=5000`. Exaggerates overfitting for double-descent visibility. |
 | `sweep_subset_50k.json` | Stage A on a **50k-sample subset**: same 8 depths, 2 seeds, `max_train_samples=50000`. |
 | `sweep_subset_150k.json` | Stage A on a **150k-sample subset**: same 8 depths, 2 seeds, `max_train_samples=150000`. |

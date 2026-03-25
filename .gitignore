@@ -17,7 +17,7 @@ asr_tests.ipynb
 *.jsonl.gz.part.1
 *.jsonl.bz2.part.1
 *.bib
-*plots/
+*plots*/
 *cmvn_comparison/
 .venv
 .mypy_cache
@@ -31,3 +31,6 @@ asr_tests.ipynb
 .env.development.local
 .env.test.local
 .env.production.local
+*.aux
+*.bbl
+*.blg

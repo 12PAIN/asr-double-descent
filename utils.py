@@ -307,7 +307,7 @@ def compute_loss_over_dataloader(
 
 
 def weight_norm_sum(model):
-    """Sum of squared L2 norms of all parameters (as in proposal: weight norms)."""
+    """Global L2 norm of all trainable parameters: sqrt(sum(||p||_2^2))."""
     return sum(p.data.norm(2).item() ** 2 for p in model.parameters() if p.requires_grad) ** 0.5
 
 
