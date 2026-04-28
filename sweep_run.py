@@ -132,6 +132,7 @@ def main():
                 val_dl=None
                 if train_kw.get("include_val_in_train", False)
                 else val_dl,
+                n_train=len(train_dl.dataset) if hasattr(train_dl, "dataset") else 0,
             )
 
             run_record = {

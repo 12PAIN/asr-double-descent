@@ -30,6 +30,7 @@
     "sharpness_eps": 1e-3,
     "sharpness_relative_eps": true,
     "cmvn_mode": "utt",
-    "global_cmvn_path": null
+    "global_cmvn_path": null,
+    "lipschitz_n_batches": 5
   }
 }

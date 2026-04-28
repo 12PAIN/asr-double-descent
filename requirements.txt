@@ -1,6 +1,8 @@
 torch>=2.0
 torchaudio
-datasets
+datasets<3.0
+soundfile
+librosa
 sentencepiece
 tqdm
 evaluate

@@ -19,8 +19,5 @@ services:
       - ./configs:/workspace/configs:ro
       - ./outputs:/workspace/outputs
       - ./spm_unigram.model:/workspace/spm_unigram.model:ro
-      - hf-cache:/cache/huggingface
+      - ~/.cache/huggingface:/cache/huggingface
     working_dir: /workspace
-
-volumes:
-  hf-cache:

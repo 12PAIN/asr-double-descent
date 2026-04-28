@@ -12,6 +12,7 @@ def _infinite_dataloader(dl):
         yield from dl
 
 
+import datetime
 import torch
 import evaluate
 from tqdm import tqdm
@@ -374,8 +375,10 @@ def run_training(
                     except Exception as _e:
                         tqdm.write(f"[bound] compute_conformer_complexity failed: {_e}")
 
+                _now = datetime.datetime.now(datetime.timezone.utc)
                 row = {
                     "step": opt_step,
+                    "eval_timestamp": _now.isoformat(),
                     "train_loss": train_loss_step_avg,
                     "train_loss_iter_avg": train_loss_iter_avg,
                     "train_eval_loss": train_metrics["loss"],
@@ -429,6 +432,7 @@ def run_training(
                         row[key] = tc[key]
                 step_logs.append(row)
                 tqdm.write(
+                    f"[{_now.strftime('%Y-%m-%d %H:%M:%S')} UTC] "
                     f"step {opt_step} train_loss={train_loss_step_avg:.4f} "
                     f"train_eval_loss={train_metrics['loss']:.4f} "
                     f"val_loss={val_metrics['loss']:.4f} "
