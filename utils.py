@@ -6,6 +6,182 @@ from tqdm import tqdm
 from conformer import ctc_greedy_decode
 
 
+# ---------------------------------------------------------------------------
+# Architecture complexity and Rademacher bound (Section 4-5 of the paper)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _spectral_norm_matrix(W: torch.Tensor) -> float:
+    """Largest singular value of a weight tensor, reshaped to 2D."""
+    if W.dim() == 1:
+        return float(W.abs().max())
+    W2 = W.float().reshape(W.size(0), -1)
+    return float(torch.linalg.svdvals(W2).max())
+
+
+@torch.no_grad()
+def compute_conformer_complexity(model, n_train: int, T_max: int, K: int) -> dict:
+    """
+    Compute C_Conf and C_G for the Rademacher bound (Corollary 2 in the paper).
+
+    C_Conf = (prod_l Lambda_l) * (sum_l Delta_l^{2/3})^{3/2}
+    C_G = C_Conf^2 * log(n * d * T_max * K)
+
+    Per-block Lipschitz constants use spectral norms of weight matrices:
+      - FF: ||W2||_s * Swish_Lip * ||W1||_s   (Swish_Lip <= 1.1)
+      - MHSA: ||W_in||_s * ||W_out||_s
+      - Conv: ||W_pw1||_s * max_c(||w_c||_1) * ||BN||_Lip * Swish_Lip * ||W_pw2||_s
+        where max_c(||w_c||_1) is the Toeplitz spectral bound (||w||_1 for each channel).
+    Residual connections: L_r^res = 1 + scale * L_r (FF modules use scale=0.5).
+    LayerNorm is 1-Lipschitz.
+
+    NOTE: The bound is conditional on Assumption 2 (covering lemma for the Toeplitz
+    convolution submodule -- the main open step acknowledged in the paper).
+    In practice C_G is large, so the bound may be vacuous for big models; it is
+    an architectural upper bound, not a tight estimate.
+    """
+    d = model.ctc_head.in_features
+    swish_lip = 1.1  # empirical upper bound on max |d/dx [x * sigmoid(x)]|
+
+    Lambda_list = []
+    Delta_list = []
+
+    for block in model.layers:
+        # --- per-submodule Lipschitz constants (inner, before scaling by residual) ---
+
+        # FF1: Linear(d,4d) -> Swish -> Linear(4d,d)
+        L_ff1 = (
+            _spectral_norm_matrix(block.ff1.net[0].weight)
+            * swish_lip
+            * _spectral_norm_matrix(block.ff1.net[3].weight)
+        )
+
+        # MHSA: in_proj [3d,d] and out_proj [d,d]
+        mha = block.mhsa.mha
+        L_mhsa = (
+            _spectral_norm_matrix(mha.in_proj_weight)
+            * _spectral_norm_matrix(mha.out_proj.weight)
+        )
+
+        # Conv: pw1 -> GLU -> depthwise -> BN -> Swish -> pw2
+        W_pw1 = block.conv.pointwise1.weight.squeeze(-1)  # [2d, d]
+        L_pw1 = _spectral_norm_matrix(W_pw1)
+
+        # Depthwise: weight [d, 1, k]; Toeplitz spectral bound = max_c ||w_c||_1
+        w_dw = block.conv.depthwise.weight.squeeze(1)  # [d, k]
+        L_dw = float(w_dw.abs().sum(dim=1).max())
+
+        # BatchNorm: |gamma_c| / sqrt(running_var_c + eps) per channel
+        bn = block.conv.bn
+        if bn.running_var is not None and bn.weight is not None:
+            L_bn = float((bn.weight.abs() / (bn.running_var + bn.eps).sqrt()).max())
+        else:
+            L_bn = 1.0
+
+        W_pw2 = block.conv.pointwise2.weight.squeeze(-1)  # [d, d]
+        L_pw2 = _spectral_norm_matrix(W_pw2)
+        L_conv = L_pw1 * L_dw * L_bn * swish_lip * L_pw2
+
+        # FF2: same structure as FF1
+        L_ff2 = (
+            _spectral_norm_matrix(block.ff2.net[0].weight)
+            * swish_lip
+            * _spectral_norm_matrix(block.ff2.net[3].weight)
+        )
+
+        # --- residual Lipschitz constants: L_r^res = 1 + scale * L_r ---
+        # Order: ff1 (scale=0.5), mhsa (scale=1), conv (scale=1), ff2 (scale=0.5), norm_out (1-Lip)
+        L_res = [
+            1.0 + 0.5 * L_ff1,   # FF1 residual
+            1.0 + L_mhsa,         # MHSA residual
+            1.0 + L_conv,         # Conv residual
+            1.0 + 0.5 * L_ff2,   # FF2 residual
+            1.0,                  # output LayerNorm: 1-Lipschitz, no bypass
+        ]
+        # "inner" Lipschitz (the part that enters the deviation factor a_r)
+        L_inner = [0.5 * L_ff1, L_mhsa, L_conv, 0.5 * L_ff2, 0.0]
+
+        # Lambda_l = prod_r L_r^res
+        Lambda_l = 1.0
+        for lr in L_res:
+            Lambda_l *= lr
+        Lambda_list.append(Lambda_l)
+
+        # C_blk_l = (sum_r (alpha_r * L_r_inner)^{2/3})^{3/2}
+        # alpha_r = prod_{s > r} L_s^res  (tail product of residual constants)
+        terms = []
+        for r in range(len(L_res)):
+            alpha_r = 1.0
+            for s in range(r + 1, len(L_res)):
+                alpha_r *= L_res[s]
+            terms.append((alpha_r * L_inner[r]) ** (2.0 / 3.0))
+        Delta_list.append(sum(terms) ** (3.0 / 2.0))
+
+    # C_Conf = (prod_l Lambda_l) * (sum_l Delta_l^{2/3})^{3/2}
+    prod_Lambda = 1.0
+    for lam in Lambda_list:
+        prod_Lambda *= lam
+
+    sum_Delta_23 = sum(dl ** (2.0 / 3.0) for dl in Delta_list)
+    C_conf = prod_Lambda * (sum_Delta_23 ** (3.0 / 2.0))
+
+    log_factor = math.log(max(n_train * d * T_max * K, 2))
+    C_G = C_conf ** 2 * log_factor
+
+    return {
+        "C_conf": C_conf,
+        "C_G": C_G,
+        "Lambda_per_block": Lambda_list,
+        "Delta_per_block": Delta_list,
+        "log_factor": log_factor,
+    }
+
+
+def rademacher_gen_bound(
+    C_G: float,
+    n: int,
+    B: float,
+    delta: float = 0.05,
+    C_prime: float = 4.0,
+) -> dict:
+    """
+    Rademacher generalization bound, Eq. (1) in the paper:
+
+      G(theta, S) <= C' * sqrt(C_G/n) * (1 + log(B/sqrt(C_G/n)))
+                   + B * sqrt(log(1/delta) / n)
+
+    This follows from Dudley's entropy integral with optimal alpha* = sqrt(C_G/n).
+    The paper writes the log argument as B*sqrt(n/C_G) = B/alpha*, which is equivalent.
+
+    When alpha* >= B (i.e. C_G/n >= B^2), the Dudley infimum is achieved at alpha=B,
+    giving the trivial diameter bound: Rademacher complexity <= B. In that case the
+    Rademacher term is vacuous (C'*B). For large networks this is always the case.
+
+    C_prime: constant from the bounded-loss Rademacher inequality + Dudley integral;
+             the paper writes C' without specifying its value (typically 2-8).
+    delta: failure probability.
+
+    Returns a dict with the full bound and each additive term.
+    """
+    alpha_star = math.sqrt(max(C_G / n, 1e-300))  # optimal Dudley threshold
+    if alpha_star >= B:
+        # Dudley integral collapses: infimum at alpha=B gives trivial bound C'*B
+        rademacher_term = C_prime * B
+        vacuous = True
+    else:
+        # alpha_star < B: log(B/alpha_star) > 0, formula is valid
+        rademacher_term = C_prime * alpha_star * (1.0 + math.log(B / alpha_star))
+        vacuous = False
+    confidence_term = B * math.sqrt(math.log(max(1.0 / delta, 1.0 + 1e-10)) / n)
+    return {
+        "gen_bound": rademacher_term + confidence_term,
+        "rademacher_term": rademacher_term,
+        "confidence_term": confidence_term,
+        "sqrt_CG_over_n": alpha_star,
+        "vacuous": vacuous,
+    }
+
+
 class WarmupCosineScheduler:
     """Linear warmup (pct_start of steps) + cosine decay to min_lr. Step-based."""
 
@@ -67,9 +243,15 @@ def evaluate_dataloader(
     desc="Eval",
     return_texts=False,
     use_keep_mask=False,
+    clip_B=None,
 ):
     """
     Single pass over a dataloader: forward, CTC loss, and optionally greedy decode + WER.
+
+    Also computes norm_loss = mean(ell_CTC / T) and clipped_norm_loss = mean(min(ell_CTC/T, B)),
+    where T is the logit sequence length (after subsampling). These match the paper's clipped
+    normalized CTC loss ell_B used in the three-term decomposition.
+
     With return_texts=False (default) the decode and sp.decode calls are skipped entirely;
     "wer" is NaN and "predictions"/"references" are empty lists.
     With return_texts=True behaviour is unchanged: full decode, WER, and text lists returned.
@@ -78,7 +260,11 @@ def evaluate_dataloader(
     """
     model.eval()
     ctc = nn.CTCLoss(blank=blank_id, reduction="mean", zero_infinity=True).to(device)
+    # reduction="none" gives raw per-sample -log p(z|x) without any normalization
+    ctc_none = nn.CTCLoss(blank=blank_id, reduction="none", zero_infinity=True).to(device)
     total_loss = 0.0
+    total_norm_loss = 0.0
+    total_clipped_norm_loss = 0.0
     n_loss = 0
     predictions = []
     references = []
@@ -98,10 +284,10 @@ def evaluate_dataloader(
 
         with torch.amp.autocast("cuda", enabled=use_amp):
             logits, out_lengths = model(features, feature_lengths)
+            log_probs = logits.log_softmax(dim=-1).transpose(0, 1)  # [T', B, K]
             if use_keep_mask:
                 keep = out_lengths >= target_lengths
                 if keep.sum().item() > 0:
-                    log_probs = logits.log_softmax(dim=-1).transpose(0, 1)
                     loss = ctc(
                         log_probs[:, keep, :],
                         targets[keep],
@@ -110,12 +296,32 @@ def evaluate_dataloader(
                     )
                     if torch.isfinite(loss):
                         total_loss += loss.item()
+                        # per-sample normalized loss for kept samples
+                        per_s = ctc_none(
+                            log_probs[:, keep, :], targets[keep],
+                            out_lengths[keep], target_lengths[keep],
+                        ).float()
+                        T_kept = out_lengths[keep].float().clamp_min(1)
+                        norm = per_s / T_kept  # ell_bar_CTC = ell_CTC / T
+                        clipped = norm.clamp_max(clip_B) if clip_B is not None else norm
+                        finite = norm.isfinite()
+                        if finite.any():
+                            total_norm_loss += norm[finite].mean().item()
+                            total_clipped_norm_loss += clipped[finite].mean().item()
                         n_loss += 1
             else:
-                log_probs = logits.log_softmax(dim=-1).transpose(0, 1)
                 loss = ctc(log_probs, targets, out_lengths, target_lengths)
                 if torch.isfinite(loss):
                     total_loss += loss.item()
+                    # per-sample normalized loss: ell_bar_CTC = ell_CTC / T
+                    per_s = ctc_none(log_probs, targets, out_lengths, target_lengths).float()
+                    T_all = out_lengths.float().clamp_min(1)
+                    norm = per_s / T_all
+                    clipped = norm.clamp_max(clip_B) if clip_B is not None else norm
+                    finite = norm.isfinite()
+                    if finite.any():
+                        total_norm_loss += norm[finite].mean().item()
+                        total_clipped_norm_loss += clipped[finite].mean().item()
                     n_loss += 1
 
         if return_texts:
@@ -141,6 +347,8 @@ def evaluate_dataloader(
     )
     return {
         "loss": mean_loss,
+        "norm_loss": total_norm_loss / max(n_loss, 1),
+        "clipped_norm_loss": total_clipped_norm_loss / max(n_loss, 1),
         "wer": wer,
         "predictions": predictions,
         "references": references,
@@ -309,6 +517,48 @@ def compute_loss_over_dataloader(
 def weight_norm_sum(model):
     """Global L2 norm of all trainable parameters: sqrt(sum(||p||_2^2))."""
     return sum(p.data.norm(2).item() ** 2 for p in model.parameters() if p.requires_grad) ** 0.5
+
+
+def ctc_lipschitz_proxy(model, dl, device, blank_id=0, n_batches=5):
+    """
+    Empirical mean of ||nabla_U ell_bar_CTC(x,z;U)||_F per sample.
+    Proposition 2 proves this is <= sqrt(2/T) <= sqrt(2).
+    Uses CTC backprop identity: nabla_{u_t} ell_CTC = y_t - gamma_t,
+    so the gradient w.r.t. the logit tensor U gives (y - gamma) directly.
+    Requires one backward pass per batch; does not update model weights.
+    """
+    model.eval()
+    ctc_none = nn.CTCLoss(blank=blank_id, reduction="none", zero_infinity=True).to(device)
+    norms = []
+    for batch_idx, (features, feature_lengths, targets, target_lengths) in enumerate(dl):
+        if batch_idx >= n_batches:
+            break
+        features = features.to(device)
+        feature_lengths = feature_lengths.to(device)
+        targets = targets.to(device)
+        target_lengths = target_lengths.to(device)
+
+        with torch.no_grad():
+            logits, out_lengths = model(features, feature_lengths)
+
+        # Compute gradient w.r.t. the logit tensor U (not model parameters).
+        # CTCLoss backprop gives: grad[b, t, k] = d ell_CTC(b) / d U[b,t,k] = y[b,t,k] - gamma[b,t,k]
+        U = logits.detach().float().requires_grad_(True)  # [B, T', K]
+        log_probs = U.log_softmax(dim=-1).transpose(0, 1)  # [T', B, K]
+        per_sample = ctc_none(log_probs, targets, out_lengths, target_lengths)  # [B]
+        per_sample.sum().backward()
+
+        if U.grad is not None:
+            with torch.no_grad():
+                for b in range(U.size(0)):
+                    T_b = int(out_lengths[b].item())
+                    if T_b <= 0:
+                        continue
+                    grad_b = U.grad[b, :T_b, :]  # [T_b, K]: d ell / d U_b
+                    if grad_b.isfinite().all():
+                        # (1/T) * ||d ell / d U_b||_F = ||d ell_bar / d U_b||_F
+                        norms.append(grad_b.norm(p="fro").item() / T_b)
+    return float(sum(norms) / len(norms)) if norms else float("nan")
 
 
 def sharpness_proxy(

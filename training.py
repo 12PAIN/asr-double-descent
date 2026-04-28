@@ -19,7 +19,10 @@ import random, numpy as np
 from conformer import ConformerCTC
 from utils import (
     WarmupCosineScheduler,
+    compute_conformer_complexity,
+    ctc_lipschitz_proxy,
     evaluate_dataloader,
+    rademacher_gen_bound,
     sharpness_proxy,
     train_one_step,
     weight_norm_sum,
@@ -39,6 +42,14 @@ DEFAULT_TRAIN_CONFIG = {
     "sharpness_n_batches": 10,
     "sharpness_eps": 1e-3,
     "sharpness_relative_eps": True,
+    # clipping level B for ell_B = min(ell_CTC/T, B); used in three-term decomposition
+    "clip_B": 10.0,
+    # n batches for empirical Lipschitz proxy (Proposition 2); 0 = skip
+    "lipschitz_n_batches": 0,
+    # Rademacher bound parameters (Corollary 3)
+    "delta": 0.05,    # failure probability
+    "C_prime": 4.0,   # constant in the Rademacher inequality (paper writes C'; typically 2-8)
+    "T_max": 750,     # max logit sequence length after subsampling (approx 30s / 4x sub = 750)
 }
 
 DEFAULT_MODEL_CONFIG = {
@@ -117,6 +128,7 @@ def run_training(
     progress_desc="Steps",
     on_eval_callback=None,
     val_dl=None,
+    n_train=0,
 ):
     """
     Run step-based training. Shared by train.py and sweep_run.py.
@@ -143,6 +155,14 @@ def run_training(
     sharpness_eps = tc["sharpness_eps"]
     sharpness_relative_eps = tc["sharpness_relative_eps"]
     use_keep_mask = tc.get("use_keep_mask", False)
+    clip_B = tc.get("clip_B", 10.0)
+    lipschitz_n_batches = tc.get("lipschitz_n_batches", 0)
+    delta = tc.get("delta", 0.05)
+    C_prime = tc.get("C_prime", 4.0)
+    T_max = tc.get("T_max", 750)
+    # annotation bias bound rho*B (Proposition 4); rho = max of static or runtime noise rate
+    noise_p = max(tc.get("label_noise_p", 0.0), tc.get("rt_noise_p", 0.0))
+    annotation_bias_bound = noise_p * clip_B
 
     if seed is not None:
         torch.manual_seed(seed)
@@ -252,6 +272,7 @@ def run_training(
                     desc="Train eval",
                     return_texts=True,
                     use_keep_mask=use_keep_mask,
+                    clip_B=clip_B,
                 )
                 if val_dl is not None:
                     val_metrics = evaluate_dataloader(
@@ -266,9 +287,11 @@ def run_training(
                         desc="Val eval",
                         return_texts=True,
                         use_keep_mask=use_keep_mask,
+                        clip_B=clip_B,
                     )
                 else:
-                    val_metrics = {"loss": float("nan"), "wer": float("nan")}
+                    val_metrics = {"loss": float("nan"), "wer": float("nan"),
+                                   "norm_loss": float("nan"), "clipped_norm_loss": float("nan")}
                 test_metrics = evaluate_dataloader(
                     model,
                     test_dl,
@@ -281,6 +304,7 @@ def run_training(
                     desc="Test eval",
                     return_texts=True,
                     use_keep_mask=use_keep_mask,
+                    clip_B=clip_B,
                 )
 
                 weight_norm = weight_norm_sum(model)
@@ -298,12 +322,57 @@ def run_training(
                     if sharpness_n_batches > 0
                     else float("nan")
                 )
+                lipschitz_emp = (
+                    ctc_lipschitz_proxy(
+                        model, test_dl, device, blank_id=blank_id,
+                        n_batches=lipschitz_n_batches,
+                    )
+                    if lipschitz_n_batches > 0
+                    else float("nan")
+                )
                 test_loss_val = test_metrics["loss"]
                 sharpness_rel = (
                     sharpness / (float(test_loss_val) + 1e-12)
                     if sharpness_n_batches > 0
                     else float("nan")
                 )
+
+                # Three-term decomposition (Proposition 1 + Proposition 4):
+                #   R*(theta) = R_hat(theta) + G(theta,S) - AB(theta)
+                #   R*(theta) <= R_hat_rho + G + rho*B    (Corollary 3)
+                # Here R_hat ~ clipped_norm_train_eval_loss, R ~ clipped_norm_test_loss,
+                # G = R - R_hat, AB <= rho*B = annotation_bias_bound.
+                _cn_train = train_metrics["clipped_norm_loss"]
+                _cn_test = test_metrics["clipped_norm_loss"]
+                _norm_gap = _cn_test - _cn_train  # G(theta, S) on clipped normalized loss
+                # R*(theta) <= R_hat + G + rho*B = R + rho*B (upper bound on oracle risk)
+                _oracle_upper = _cn_test + annotation_bias_bound
+
+                # Rademacher generalization bound (Corollary 3 in the paper).
+                # Requires n_train > 0. Bound is conditional on Assumption 2 (open Toeplitz lemma).
+                _C_conf = float("nan")
+                _C_G = float("nan")
+                _rad_term = float("nan")
+                _conf_term = float("nan")
+                _gen_bound = float("nan")
+                _oracle_risk_bound = float("nan")
+                if n_train > 0:
+                    try:
+                        _cpx = compute_conformer_complexity(
+                            model, n_train=n_train, T_max=T_max, K=vocab_size
+                        )
+                        _C_conf = _cpx["C_conf"]
+                        _C_G = _cpx["C_G"]
+                        _bnd = rademacher_gen_bound(
+                            C_G=_C_G, n=n_train, B=clip_B, delta=delta, C_prime=C_prime
+                        )
+                        _rad_term = _bnd["rademacher_term"]
+                        _conf_term = _bnd["confidence_term"]
+                        _gen_bound = _bnd["gen_bound"]
+                        # Full oracle risk bound: R_hat + gen_bound + rho*B  (Corollary 3)
+                        _oracle_risk_bound = _cn_train + _gen_bound + annotation_bias_bound
+                    except Exception as _e:
+                        tqdm.write(f"[bound] compute_conformer_complexity failed: {_e}")
 
                 row = {
                     "step": opt_step,
@@ -321,6 +390,28 @@ def run_training(
                     "generalization_gap": (
                         test_metrics["loss"] - train_metrics["loss"]
                     ),
+                    # --- three-term decomposition metrics (paper Section 3-6) ---
+                    # norm_loss = mean(ell_CTC / T); clipped_norm_loss = mean(min(ell_CTC/T, B))
+                    "norm_train_eval_loss": train_metrics["norm_loss"],
+                    "norm_test_loss": test_metrics["norm_loss"],
+                    "clipped_norm_train_eval_loss": _cn_train,   # R_hat(theta)
+                    "clipped_norm_test_loss": _cn_test,          # R(theta)
+                    "norm_generalization_gap": _norm_gap,        # G(theta, S)
+                    "annotation_bias_bound": annotation_bias_bound,  # rho*B upper bound on AB
+                    "oracle_risk_upper": _oracle_upper,          # R*(theta) <= R + rho*B
+                    "clip_B": clip_B,
+                    # empirical Lipschitz proxy: ||nabla_U ell_bar||_F, Prop 2 claims <= sqrt(2)
+                    "lipschitz_proxy_empirical": lipschitz_emp,
+                    # --- Rademacher bound (Corollary 3, conditional on Assumption 2) ---
+                    # G(theta,S) <= rademacher_term + confidence_term
+                    # R*(theta) <= R_hat + gen_bound + rho*B
+                    "C_conf": _C_conf,
+                    "C_G": _C_G,
+                    "rademacher_term": _rad_term,
+                    "confidence_term": _conf_term,
+                    "gen_bound": _gen_bound,           # bound on G(theta,S)
+                    "oracle_risk_bound": _oracle_risk_bound,  # bound on R*(theta)
+                    # ---
                     "lr": scheduler.get_last_lr()[0],
                     "skipped_overflow_steps": interval_overflow,
                     "skipped_keep0_batches": interval_keep0,

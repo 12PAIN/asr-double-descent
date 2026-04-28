@@ -73,6 +73,27 @@ def main():
     p.add_argument("--sharpness_n_batches", type=int, default=100)
     p.add_argument("--sharpness_eps", type=float, default=1e-2)
     p.add_argument("--no_sharpness_relative_eps", action="store_true")
+    p.add_argument(
+        "--clip_B", type=float, default=10.0,
+        help="Clipping level B for ell_B = min(ell_CTC/T, B) in the three-term decomposition.",
+    )
+    p.add_argument(
+        "--lipschitz_n_batches", type=int, default=0,
+        help="Batches for empirical Lipschitz proxy ||nabla_U ell_bar||_F (Prop 2). 0=skip.",
+    )
+    p.add_argument(
+        "--delta", type=float, default=0.05,
+        help="Failure probability for the Rademacher generalization bound (Corollary 3).",
+    )
+    p.add_argument(
+        "--C_prime", type=float, default=4.0,
+        help="Constant C' in the Rademacher inequality (paper writes C'; typically 2-8).",
+    )
+    p.add_argument(
+        "--T_max", type=int, default=750,
+        help="Max logit sequence length after subsampling, used in the Rademacher bound. "
+             "For LibriSpeech: ~30s audio * 100fps / 4x sub = ~750.",
+    )
     p.add_argument("--device", type=str, default=None)
     p.add_argument(
         "--cmvn_mode",
@@ -150,6 +171,11 @@ def main():
         "sharpness_eps": args.sharpness_eps,
         "sharpness_relative_eps": not args.no_sharpness_relative_eps,
         "use_keep_mask": args.keep_mask,
+        "clip_B": args.clip_B,
+        "lipschitz_n_batches": args.lipschitz_n_batches,
+        "delta": args.delta,
+        "C_prime": args.C_prime,
+        "T_max": args.T_max,
         "label_noise_mode": args.label_noise_mode,
         "label_noise_p": args.label_noise_p,
         "label_noise_k": args.label_noise_k,
@@ -211,6 +237,8 @@ def main():
                 )
                 best_test_wer = test_wer
 
+    n_train = len(train_dl.dataset) if hasattr(train_dl, "dataset") else 0
+
     model, step_logs = run_training(
         model_config=model_config,
         train_config=train_config,
@@ -225,6 +253,7 @@ def main():
         progress_desc="Steps",
         on_eval_callback=on_eval,
         val_dl=None if args.include_val_in_train else val_dl,
+        n_train=n_train,
     )
 
     n_params = count_parameters(model)

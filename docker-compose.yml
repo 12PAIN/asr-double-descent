@@ -1,0 +1,26 @@
+services:
+  sweep:
+    build: .
+    image: ml-asr-sweep
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - HF_HOME=/cache/huggingface
+    command: >
+      python sweep_run.py
+      --config /workspace/configs/${SWEEP_CONFIG:-sweep_full_extended.json}
+      --output /workspace/outputs/${SWEEP_OUTPUT:-sweep_full_extended.json}
+    volumes:
+      - ./configs:/workspace/configs:ro
+      - ./outputs:/workspace/outputs
+      - ./spm_unigram.model:/workspace/spm_unigram.model:ro
+      - hf-cache:/cache/huggingface
+    working_dir: /workspace
+
+volumes:
+  hf-cache:
