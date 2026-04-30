@@ -1,9 +1,11 @@
+import json
 import math
+import os
 import torch
 import torch.nn as nn
 import evaluate
 from tqdm import tqdm
-from conformer import ctc_greedy_decode
+from conformer import ctc_greedy_decode, ctc_beam_search_decode
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +201,10 @@ class WarmupCosineScheduler:
         self.max_lr = max_lr
         self.min_lr = min_lr
         self._step = 0
+        # Set LR to 0 immediately so the first optimizer step starts at the warmup origin,
+        # not at whatever initial lr was passed to AdamW.
+        for g in self.optimizer.param_groups:
+            g["lr"] = 0.0
 
     def step(self):
         self._step += 1
@@ -230,6 +236,56 @@ def compute_wer(
     return float(out["wer"]) if isinstance(out, dict) else float(out)
 
 
+def compute_cer(
+    predictions: list[str],
+    references: list[str],
+    cer_metric=None,
+) -> float:
+    """Compute Character Error Rate using HuggingFace evaluate."""
+    if not predictions:
+        return float("nan")
+    if cer_metric is None:
+        cer_metric = evaluate.load("cer")
+    out = cer_metric.compute(predictions=predictions, references=references)
+    return float(out["cer"]) if isinstance(out, dict) else float(out)
+
+
+@torch.no_grad()
+def _ctc_alignment_stats(logits, out_lengths, blank_id=0):
+    """
+    Per-batch CTC alignment diagnostics from raw logits [B, T, V].
+
+    Returns:
+        alignment_entropy  - mean frame entropy H(p_t) in nats, averaged over valid frames.
+                             High = diffuse/uncertain alignment.
+        blank_mass         - mean p(blank | t) over valid frames.
+                             High = model heavily relies on blank (sparse token emission).
+        seq_confidence     - mean log P(argmax_t | t) over valid frames.
+                             Closer to 0 = confident greedy path; more negative = uncertain.
+    """
+    log_probs = logits.float().log_softmax(dim=-1)  # [B, T, V]
+    probs = log_probs.exp()
+    B, T_max, _ = probs.shape
+
+    t_idx = torch.arange(T_max, device=logits.device).unsqueeze(0)  # [1, T_max]
+    mask = t_idx < out_lengths.unsqueeze(1)  # [B, T_max]
+
+    n_frames = mask.sum().item()
+    if n_frames == 0:
+        nan = float("nan")
+        return {"alignment_entropy": nan, "blank_mass": nan, "seq_confidence": nan}
+
+    entropy = -(probs * log_probs).sum(dim=-1)          # [B, T_max]
+    blank_p = probs[:, :, blank_id]                     # [B, T_max]
+    max_log_p = log_probs.max(dim=-1).values            # [B, T_max]
+
+    return {
+        "alignment_entropy": entropy[mask].mean().item(),
+        "blank_mass":        blank_p[mask].mean().item(),
+        "seq_confidence":    max_log_p[mask].mean().item(),
+    }
+
+
 @torch.no_grad()
 def evaluate_dataloader(
     model,
@@ -238,36 +294,47 @@ def evaluate_dataloader(
     device,
     blank_id=0,
     wer_metric=None,
+    cer_metric=None,
     max_batches=None,
     use_amp=True,
     desc="Eval",
     return_texts=False,
     use_keep_mask=False,
     clip_B=None,
+    collect_logits=False,
 ):
     """
-    Single pass over a dataloader: forward, CTC loss, and optionally greedy decode + WER.
+    Single pass over a dataloader: forward, CTC loss, and optionally greedy decode + WER/CER.
 
     Also computes norm_loss = mean(ell_CTC / T) and clipped_norm_loss = mean(min(ell_CTC/T, B)),
     where T is the logit sequence length (after subsampling). These match the paper's clipped
     normalized CTC loss ell_B used in the three-term decomposition.
 
-    With return_texts=False (default) the decode and sp.decode calls are skipped entirely;
-    "wer" is NaN and "predictions"/"references" are empty lists.
-    With return_texts=True behaviour is unchanged: full decode, WER, and text lists returned.
-    With use_keep_mask=False the keep = out_lengths >= target_lengths guard is skipped
-    entirely (no GPU -> CPU sync); CTCLoss(zero_infinity=True) handles short sequences.
+    Always computes CTC alignment diagnostics from logits:
+        alignment_entropy  -- mean frame entropy H(p_t) in nats.
+        blank_mass         -- mean p(blank | t) over valid frames.
+        seq_confidence     -- mean log P(argmax_t | t) over valid frames.
+
+    With return_texts=True also computes WER and CER (requires cer_metric or loads on demand).
+    With collect_logits=True returns "logits_list": list of (logits_cpu, out_lengths_cpu) tuples.
     """
     model.eval()
     ctc = nn.CTCLoss(blank=blank_id, reduction="mean", zero_infinity=True).to(device)
     # reduction="none" gives raw per-sample -log p(z|x) without any normalization
     ctc_none = nn.CTCLoss(blank=blank_id, reduction="none", zero_infinity=True).to(device)
-    total_loss = 0.0
-    total_norm_loss = 0.0
-    total_clipped_norm_loss = 0.0
-    n_loss = 0
+    total_loss_sum = 0.0        # sum of per-sample CTC losses (finite only)
+    total_loss_tokens = 0       # sum of target lengths (for per-token normalization)
+    total_norm_loss_sum = 0.0
+    total_clipped_norm_loss_sum = 0.0
+    n_loss_samples = 0  # finite sample count for micro-averaged norm/clipped losses
+    n_loss = 0          # batch count (kept for reference)
+    total_align_entropy = 0.0
+    total_blank_mass = 0.0
+    total_seq_confidence = 0.0
+    n_align = 0
     predictions = []
     references = []
+    logits_list = [] if collect_logits else None
 
     for batch_idx, (
         features,
@@ -288,41 +355,48 @@ def evaluate_dataloader(
             if use_keep_mask:
                 keep = out_lengths >= target_lengths
                 if keep.sum().item() > 0:
-                    loss = ctc(
-                        log_probs[:, keep, :],
-                        targets[keep],
-                        out_lengths[keep],
-                        target_lengths[keep],
-                    )
-                    if torch.isfinite(loss):
-                        total_loss += loss.item()
-                        # per-sample normalized loss for kept samples
-                        per_s = ctc_none(
-                            log_probs[:, keep, :], targets[keep],
-                            out_lengths[keep], target_lengths[keep],
-                        ).float()
-                        T_kept = out_lengths[keep].float().clamp_min(1)
-                        norm = per_s / T_kept  # ell_bar_CTC = ell_CTC / T
-                        clipped = norm.clamp_max(clip_B) if clip_B is not None else norm
-                        finite = norm.isfinite()
-                        if finite.any():
-                            total_norm_loss += norm[finite].mean().item()
-                            total_clipped_norm_loss += clipped[finite].mean().item()
-                        n_loss += 1
-            else:
-                loss = ctc(log_probs, targets, out_lengths, target_lengths)
-                if torch.isfinite(loss):
-                    total_loss += loss.item()
-                    # per-sample normalized loss: ell_bar_CTC = ell_CTC / T
-                    per_s = ctc_none(log_probs, targets, out_lengths, target_lengths).float()
-                    T_all = out_lengths.float().clamp_min(1)
-                    norm = per_s / T_all
+                    # per-sample loss for micro-averaging (no reduction="mean")
+                    per_s = ctc_none(
+                        log_probs[:, keep, :], targets[keep],
+                        out_lengths[keep], target_lengths[keep],
+                    ).float()
+                    T_kept = out_lengths[keep].float().clamp_min(1)
+                    norm = per_s / T_kept  # ell_bar_CTC = ell_CTC / T
                     clipped = norm.clamp_max(clip_B) if clip_B is not None else norm
                     finite = norm.isfinite()
-                    if finite.any():
-                        total_norm_loss += norm[finite].mean().item()
-                        total_clipped_norm_loss += clipped[finite].mean().item()
+                    n_finite = int(finite.sum().item())
+                    if n_finite > 0:
+                        total_loss_sum += per_s[finite].sum().item()
+                        total_loss_tokens += int(target_lengths[keep][finite].sum().item())
+                        total_norm_loss_sum += norm[finite].sum().item()
+                        total_clipped_norm_loss_sum += clipped[finite].sum().item()
+                        n_loss_samples += n_finite
                     n_loss += 1
+            else:
+                # per-sample loss for micro-averaging
+                per_s = ctc_none(log_probs, targets, out_lengths, target_lengths).float()
+                T_all = out_lengths.float().clamp_min(1)
+                norm = per_s / T_all  # ell_bar_CTC = ell_CTC / T
+                clipped = norm.clamp_max(clip_B) if clip_B is not None else norm
+                finite = norm.isfinite()
+                n_finite = int(finite.sum().item())
+                if n_finite > 0:
+                    total_loss_sum += per_s[finite].sum().item()
+                    total_loss_tokens += int(target_lengths[finite].sum().item())
+                    total_norm_loss_sum += norm[finite].sum().item()
+                    total_clipped_norm_loss_sum += clipped[finite].sum().item()
+                    n_loss_samples += n_finite
+                n_loss += 1
+
+        # alignment diagnostics - cheap tensor ops, always computed
+        a_stats = _ctc_alignment_stats(logits, out_lengths, blank_id)
+        total_align_entropy  += a_stats["alignment_entropy"]
+        total_blank_mass     += a_stats["blank_mass"]
+        total_seq_confidence += a_stats["seq_confidence"]
+        n_align += 1
+
+        if collect_logits:
+            logits_list.append((logits.cpu(), out_lengths.cpu()))
 
         if return_texts:
             hyps = ctc_greedy_decode(logits, out_lengths, blank_id=blank_id)
@@ -341,18 +415,108 @@ def evaluate_dataloader(
                 predictions.extend(sp.decode(valid_hyps))  # one batched call
                 references.extend(sp.decode(valid_tgts))  # one batched call
 
-    mean_loss = total_loss / max(n_loss, 1)
+    n = max(n_loss_samples, 1)
+    # loss: micro-average over tokens (sum_samples ell_CTC / sum_samples T_tgt).
+    # NOTE: nn.CTCLoss(reduction="mean") computes a macro-average (mean_b[ell/T_tgt]),
+    # so train_loss (from training step) and train_eval_loss are on different scales.
+    mean_loss = total_loss_sum / max(total_loss_tokens, 1)
     wer = (
         compute_wer(predictions, references, wer_metric=wer_metric) if predictions else float("nan")
     )
-    return {
+    cer = (
+        compute_cer(predictions, references, cer_metric=cer_metric) if predictions else float("nan")
+    )
+    result = {
         "loss": mean_loss,
-        "norm_loss": total_norm_loss / max(n_loss, 1),
-        "clipped_norm_loss": total_clipped_norm_loss / max(n_loss, 1),
+        "norm_loss": total_norm_loss_sum / n,
+        "clipped_norm_loss": total_clipped_norm_loss_sum / n,
         "wer": wer,
+        "cer": cer,
+        "alignment_entropy":  total_align_entropy  / max(n_align, 1),
+        "blank_mass":         total_blank_mass      / max(n_align, 1),
+        "seq_confidence":     total_seq_confidence  / max(n_align, 1),
         "predictions": predictions,
         "references": references,
     }
+    if collect_logits:
+        result["logits_list"] = logits_list
+    return result
+
+
+def save_final_predictions(
+    model,
+    val_dl,
+    test_dl,
+    sp,
+    device,
+    blank_id,
+    output_dir,
+    beam_sizes=(10,),
+    wer_metric=None,
+    cer_metric=None,
+    use_amp=True,
+    use_keep_mask=False,
+):
+    """Run full-loader eval (greedy + beam search for each size in beam_sizes) and save to JSON.
+
+    Writes {output_dir}/final_predictions_{val|test}.json.
+    Greedy is always computed. Beam search reuses logits buffered during the greedy pass.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    if wer_metric is None:
+        wer_metric = evaluate.load("wer")
+
+    for name, dl in [("val", val_dl), ("test", test_dl)]:
+        if dl is None:
+            continue
+
+        if cer_metric is None:
+            cer_metric = evaluate.load("cer")
+
+        result = evaluate_dataloader(
+            model, dl, sp, device,
+            blank_id=blank_id, wer_metric=wer_metric, cer_metric=cer_metric,
+            max_batches=None,
+            use_amp=use_amp, desc=f"Final {name} (greedy)",
+            return_texts=True,
+            use_keep_mask=use_keep_mask,
+            collect_logits=True,
+        )
+
+        out = {
+            "references": result["references"],
+            "predictions_greedy": result["predictions"],
+            "wer_greedy": result["wer"],
+            "cer_greedy": result["cer"],
+            "beam": {},
+            "beam_sizes": list(beam_sizes),
+        }
+
+        logits_list = result["logits_list"]  # list of (logits [B,T,V], out_lengths [B])
+        references = result["references"]
+
+        for bsz in beam_sizes:
+            all_hyps = []
+            for logits_cpu, lengths_cpu in tqdm(logits_list, desc=f"Beam {bsz} {name}"):
+                batch_hyps = ctc_beam_search_decode(
+                    logits_cpu, lengths_cpu, blank_id=blank_id, beam_size=bsz
+                )
+                all_hyps.extend(batch_hyps)
+            preds_beam = sp.decode(all_hyps)
+            wer_beam = (
+                compute_wer(preds_beam, references, wer_metric=wer_metric)
+                if preds_beam else float("nan")
+            )
+            cer_beam = (
+                compute_cer(preds_beam, references, cer_metric=cer_metric)
+                if preds_beam else float("nan")
+            )
+            out["beam"][str(bsz)] = {"predictions": preds_beam, "wer": wer_beam, "cer": cer_beam}
+
+        path = os.path.join(output_dir, f"final_predictions_{name}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, ensure_ascii=False)
+        tqdm.write(f"[save_final_predictions] wrote {path}")
 
 
 @torch.no_grad()
@@ -516,10 +680,11 @@ def compute_loss_over_dataloader(
 
 def weight_norm_sum(model):
     """Global L2 norm of all trainable parameters: sqrt(sum(||p||_2^2))."""
-    return sum(p.data.norm(2).item() ** 2 for p in model.parameters() if p.requires_grad) ** 0.5
+    params = [p.data.flatten() for p in model.parameters() if p.requires_grad]
+    return torch.cat(params).norm(2).item()
 
 
-def ctc_lipschitz_proxy(model, dl, device, blank_id=0, n_batches=5):
+def ctc_lipschitz_proxy(model, dl, device, blank_id=0, n_batches=5, use_amp=True):
     """
     Empirical mean of ||nabla_U ell_bar_CTC(x,z;U)||_F per sample.
     Proposition 2 proves this is <= sqrt(2/T) <= sqrt(2).
@@ -539,7 +704,8 @@ def ctc_lipschitz_proxy(model, dl, device, blank_id=0, n_batches=5):
         target_lengths = target_lengths.to(device)
 
         with torch.no_grad():
-            logits, out_lengths = model(features, feature_lengths)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits, out_lengths = model(features, feature_lengths)
 
         # Compute gradient w.r.t. the logit tensor U (not model parameters).
         # CTCLoss backprop gives: grad[b, t, k] = d ell_CTC(b) / d U[b,t,k] = y[b,t,k] - gamma[b,t,k]
@@ -571,6 +737,7 @@ def sharpness_proxy(
     n_perturbations=3,
     relative_eps=False,
     use_keep_mask=False,
+    use_amp=True,
 ):
     """
     One-sided sharpness proxy: E[ max(0, L(theta+delta) - L(theta)) ].
@@ -597,12 +764,13 @@ def sharpness_proxy(
         target_lengths = target_lengths.to(device, non_blocking=True)
 
         with torch.no_grad():
-            logits, out_lengths = model(features, feature_lengths)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits, out_lengths = model(features, feature_lengths)
             if use_keep_mask:
                 keep = out_lengths >= target_lengths
                 if keep.sum().item() == 0:
                     continue
-        log_probs = logits.log_softmax(dim=-1).transpose(0, 1)
+        log_probs = logits.float().log_softmax(dim=-1).transpose(0, 1)
         if use_keep_mask:
             loss_orig = ctc(
                 log_probs[:, keep, :],
@@ -624,8 +792,9 @@ def sharpness_proxy(
                 for p, noise in zip(params, noises):
                     p.data.add_(noise, alpha=scale)
             with torch.no_grad():
-                logits_p, _ = model(features, feature_lengths)
-                log_probs_p = logits_p.log_softmax(dim=-1).transpose(0, 1)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    logits_p, _ = model(features, feature_lengths)
+                log_probs_p = logits_p.float().log_softmax(dim=-1).transpose(0, 1)
                 if use_keep_mask:
                     loss_pert = ctc(
                         log_probs_p[:, keep, :],

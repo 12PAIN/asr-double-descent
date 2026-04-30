@@ -1,5 +1,5 @@
 """
-Stage A — capacity and subset-ablation plots.
+Stage A - capacity and subset-ablation plots.
 
 Edit DATASETS below to add or remove training subsets.
 All figures are written to OUT_DIR (stage_a_plots/).

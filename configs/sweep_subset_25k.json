@@ -77,7 +77,7 @@
     "num_workers": 4,
     "val_max_size": null,
     "max_eval_batches": 500,
-    "max_train_samples": 150000,
+    "max_train_samples": 25000,
     "include_val_in_train": false,
     "sharpness_n_batches": 100,
     "sharpness_eps": 0.001,

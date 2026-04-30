@@ -13,8 +13,8 @@ services:
       - HF_HOME=/cache/huggingface
     command: >
       python sweep_run.py
-      --config /workspace/configs/${SWEEP_CONFIG:-sweep_full_extended.json}
-      --output /workspace/outputs/${SWEEP_OUTPUT:-sweep_full_extended.json}
+      --config /workspace/configs/${SWEEP_CONFIG:-sweep_full.json}
+      --output /workspace/outputs/${SWEEP_OUTPUT:-sweep_full.json}
     volumes:
       - ./configs:/workspace/configs:ro
       - ./outputs:/workspace/outputs

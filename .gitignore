@@ -35,3 +35,6 @@ asr_tests.ipynb
 *.bbl
 *.blg
 obisidan_vault/
+spm_unigram.zip
+outputs_copy/
+results/

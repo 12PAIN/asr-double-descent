@@ -269,12 +269,12 @@ All configs are JSON files consumed by `sweep_run.py`. Each defines `seeds`, `mo
 | `sweep_subset_5k.json` | Stage A on a **5k-sample subset**: same 8 depths, 2 seeds, `max_train_samples=5000`. Exaggerates overfitting for double-descent visibility. |
 | `sweep_subset_50k.json` | Stage A on a **50k-sample subset**: same 8 depths, 2 seeds, `max_train_samples=50000`. |
 | `sweep_subset_150k.json` | Stage A on a **150k-sample subset**: same 8 depths, 2 seeds, `max_train_samples=150000`. |
-| `sweep_regularization_none.json` | **CMVN ablation — no normalization**: single depth (8 layers), 2 seeds, `cmvn_mode="none"`. |
-| `sweep_regularization_utt.json` | **CMVN ablation — per-utterance**: single depth (8 layers), 2 seeds, `cmvn_mode="utt"`. |
-| `sweep_regularization_global.json` | **CMVN ablation — global stats**: single depth (8 layers), 2 seeds, `cmvn_mode="global"`. Uses `global_cmvn_librispeech_clean.pt`. |
-| `sweep_stage_b_p05.json` | **Stage B — label noise p=0.05**: 3 depths (4/8/16 layers), 2 seeds, `label_noise_mode="static"`, `label_noise_p=0.05`, seed 42. |
-| `sweep_stage_b_p10.json` | **Stage B — label noise p=0.10**: same 3 depths, 2 seeds, `label_noise_p=0.10`. |
-| `sweep_stage_b_p20.json` | **Stage B — label noise p=0.20**: same 3 depths, 2 seeds, `label_noise_p=0.20`. |
+| `sweep_regularization_none.json` | **CMVN ablation - no normalization**: single depth (8 layers), 2 seeds, `cmvn_mode="none"`. |
+| `sweep_regularization_utt.json` | **CMVN ablation - per-utterance**: single depth (8 layers), 2 seeds, `cmvn_mode="utt"`. |
+| `sweep_regularization_global.json` | **CMVN ablation - global stats**: single depth (8 layers), 2 seeds, `cmvn_mode="global"`. Uses `global_cmvn_librispeech_clean.pt`. |
+| `sweep_stage_b_p05.json` | **Stage B - label noise p=0.05**: 3 depths (4/8/16 layers), 2 seeds, `label_noise_mode="static"`, `label_noise_p=0.05`, seed 42. |
+| `sweep_stage_b_p10.json` | **Stage B - label noise p=0.10**: same 3 depths, 2 seeds, `label_noise_p=0.10`. |
+| `sweep_stage_b_p20.json` | **Stage B - label noise p=0.20**: same 3 depths, 2 seeds, `label_noise_p=0.20`. |
 | `sweep_test_1.json` | Quick smoke-test config (small run for debugging). |
 | `sweep_test_2.json` | Quick smoke-test config (small run for debugging). |
 

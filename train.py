@@ -18,16 +18,16 @@ def main():
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--eval_batch_size", type=int, default=32)
     p.add_argument(
-        "--max_steps",
+        "--max_epochs",
         type=int,
-        default=100_000,
-        help="Total optimizer steps (replaces epochs)",
+        default=30,
+        help="Number of full training epochs",
     )
     p.add_argument(
-        "--eval_every",
+        "--eval_every_epochs",
         type=int,
-        default=5000,
-        help="Evaluate and log every N steps",
+        default=1,
+        help="Evaluate and log after every N epochs",
     )
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=1e-6)
@@ -35,7 +35,7 @@ def main():
         "--max_lr",
         type=float,
         default=1e-4,
-        help="Max LR (OneCycle or warmup+cosine)",
+        help="Peak LR for warmup+cosine or one_cycle schedule",
     )
     p.add_argument(
         "--scheduler",
@@ -52,12 +52,11 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--val_max_size", type=int, default=None)
     p.add_argument("--output_dir", type=str, default=None)
-
     p.add_argument(
         "--max_eval_batches",
         type=int,
         default=500,
-        help="Fixed eval set size (batches); same batches every run (same seed)",
+        help="Max batches for per-epoch eval (same seed = same batches every run)",
     )
     p.add_argument(
         "--max_train_samples",
@@ -68,7 +67,7 @@ def main():
     p.add_argument(
         "--include_val_in_train",
         action="store_true",
-        help="Add validation set to training data (default: False for stage A)",
+        help="Add validation set to training data (stage A: False)",
     )
     p.add_argument("--sharpness_n_batches", type=int, default=100)
     p.add_argument("--sharpness_eps", type=float, default=1e-2)
@@ -79,20 +78,19 @@ def main():
     )
     p.add_argument(
         "--lipschitz_n_batches", type=int, default=0,
-        help="Batches for empirical Lipschitz proxy ||nabla_U ell_bar||_F (Prop 2). 0=skip.",
+        help="Batches for empirical Lipschitz proxy (Prop 2). 0=skip.",
     )
     p.add_argument(
         "--delta", type=float, default=0.05,
-        help="Failure probability for the Rademacher generalization bound (Corollary 3).",
+        help="Failure probability for the Rademacher bound (Corollary 3).",
     )
     p.add_argument(
         "--C_prime", type=float, default=4.0,
-        help="Constant C' in the Rademacher inequality (paper writes C'; typically 2-8).",
+        help="Constant C' in the Rademacher inequality.",
     )
     p.add_argument(
         "--T_max", type=int, default=750,
-        help="Max logit sequence length after subsampling, used in the Rademacher bound. "
-             "For LibriSpeech: ~30s audio * 100fps / 4x sub = ~750.",
+        help="Max logit sequence length after subsampling (approx 30s * 100fps / 4 = 750).",
     )
     p.add_argument("--device", type=str, default=None)
     p.add_argument(
@@ -100,40 +98,21 @@ def main():
         type=str,
         choices=("none", "utt", "global", "batch"),
         default="utt",
-        help="Input normalization: none, utt (per-utterance), global (train stats), batch",
     )
-    p.add_argument(
-        "--global_cmvn_path",
-        type=str,
-        default=None,
-        help="Path to load/save global CMVN stats (default: global_cmvn_librispeech_clean.pt)",
-    )
-    p.add_argument(
-        "--compute_global_cmvn",
-        action="store_true",
-        help="Recompute global CMVN from train and save (even if file exists)",
-    )
-    p.add_argument(
-        "--cmvn_max_hours",
-        type=float,
-        default=None,
-        help="Cap hours of audio when computing global CMVN (for speed)",
-    )
+    p.add_argument("--global_cmvn_path", type=str, default=None)
+    p.add_argument("--compute_global_cmvn", action="store_true")
+    p.add_argument("--cmvn_max_hours", type=float, default=None)
     p.add_argument(
         "--label_noise_mode",
         type=str,
         choices=("none", "static", "static_disk"),
         default="none",
-        help="Label noise: none, static (in-memory), static_disk (cache on disk)",
     )
     p.add_argument("--label_noise_p", type=float, default=0.0)
     p.add_argument("--label_noise_k", type=int, default=0)
     p.add_argument("--label_noise_seed", type=int, default=0)
     p.add_argument(
-        "--label_noise_replace",
-        type=str,
-        choices=("random", "unk"),
-        default="random",
+        "--label_noise_replace", type=str, choices=("random", "unk"), default="random",
     )
     p.add_argument("--label_noise_disk_path", type=str, default=None)
     p.add_argument("--label_noise_use_disk", action="store_true")
@@ -142,24 +121,32 @@ def main():
     p.add_argument("--rt_noise_p", type=float, default=0.0)
     p.add_argument("--rt_noise_seed", type=int, default=None)
     p.add_argument(
-        "--rt_noise_replace",
-        type=str,
-        choices=("random", "unk"),
-        default="random",
+        "--rt_noise_replace", type=str, choices=("random", "unk"), default="random",
     )
     p.add_argument(
         "--keep_mask",
         action="store_true",
-        help="Enable keep = out_lengths >= target_lengths guard (default: disabled). "
-             "CTCLoss(zero_infinity=True) handles short seqs without it.",
+        help="Enable keep = out_lengths >= target_lengths guard.",
+    )
+    p.add_argument(
+        "--save_predictions",
+        action="store_true",
+        help="After training, run full-loader eval and save per-utterance predictions to output_dir.",
+    )
+    p.add_argument(
+        "--beam_sizes",
+        type=int,
+        nargs="+",
+        default=[10],
+        help="Beam widths for final prediction save (e.g. --beam_sizes 5 10 50). Greedy always included.",
     )
     args = p.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     train_config = {
-        "max_steps": args.max_steps,
-        "eval_every": args.eval_every,
+        "max_epochs": args.max_epochs,
+        "eval_every_epochs": args.eval_every_epochs,
         "scheduler": args.scheduler,
         "batch_size": args.batch_size,
         "eval_batch_size": args.eval_batch_size,
@@ -181,6 +168,8 @@ def main():
         "label_noise_k": args.label_noise_k,
         "rt_noise_k": args.rt_noise_k,
         "rt_noise_p": args.rt_noise_p,
+        "save_predictions": args.save_predictions,
+        "beam_sizes": args.beam_sizes,
     }
     model_config = {
         "d_model": args.d_model,
@@ -219,15 +208,13 @@ def main():
     vocab_size = sp.get_piece_size()
     best_test_wer = float("inf")
 
-    def on_eval(step_1based, row, model):
+    def on_eval(epoch, row, model):
         nonlocal best_test_wer
         if args.output_dir:
             os.makedirs(args.output_dir, exist_ok=True)
             torch.save(
                 model.state_dict(),
-                os.path.join(
-                    args.output_dir, f"checkpoint_step_{step_1based}.pth"
-                ),
+                os.path.join(args.output_dir, f"checkpoint_epoch_{epoch}.pth"),
             )
             test_wer = row.get("test_wer", float("inf"))
             if isinstance(test_wer, (int, float)) and test_wer < best_test_wer:
@@ -239,7 +226,7 @@ def main():
 
     n_train = len(train_dl.dataset) if hasattr(train_dl, "dataset") else 0
 
-    model, step_logs = run_training(
+    model, epoch_logs = run_training(
         model_config=model_config,
         train_config=train_config,
         train_dl=train_dl,
@@ -250,10 +237,10 @@ def main():
         vocab_size=vocab_size,
         device=device,
         seed=args.seed,
-        progress_desc="Steps",
         on_eval_callback=on_eval,
         val_dl=None if args.include_val_in_train else val_dl,
         n_train=n_train,
+        output_dir=args.output_dir,
     )
 
     n_params = count_parameters(model)
@@ -261,15 +248,11 @@ def main():
 
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
-        torch.save(
-            model.state_dict(), os.path.join(args.output_dir, "final.pth")
-        )
+        torch.save(model.state_dict(), os.path.join(args.output_dir, "final.pth"))
         with open(
-            os.path.join(args.output_dir, "train_log.json"),
-            "w",
-            encoding="utf-8",
+            os.path.join(args.output_dir, "train_log.json"), "w", encoding="utf-8"
         ) as f:
-            json.dump(step_logs, f, indent=2)
+            json.dump(epoch_logs, f, indent=2)
 
     print("Done.")
 

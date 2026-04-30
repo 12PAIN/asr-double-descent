@@ -203,6 +203,9 @@ class CollateCTC:
             hop_length=hop_length,
             win_length=win_length,
         )
+        self._valid_ids = (
+            [i for i in range(vocab_size) if i != pad_id] if vocab_size is not None else []
+        )
         if global_stats is not None:
             self.global_mean = global_stats["mean"].float()  # [n_mels]
             self.global_std = global_stats["std"].float()  # [n_mels]
@@ -231,11 +234,10 @@ class CollateCTC:
         """Corrupt targets in-place within valid length. Never insert blank_id."""
         B, Smax = targets.shape
         blank_id = self.pad_id
-        vs = self.vocab_size
         unk_id = self.unk_id
-        if vs is None or (self.rt_noise_k <= 0 and self.rt_noise_p <= 0.0):
+        if self.vocab_size is None or (self.rt_noise_k <= 0 and self.rt_noise_p <= 0.0):
             return targets
-        valid_ids = [i for i in range(vs) if i != blank_id]
+        valid_ids = self._valid_ids
         if not valid_ids:
             return targets
         for i in range(B):
@@ -253,15 +255,15 @@ class CollateCTC:
                 if self.rt_noise_replace == "unk":
                     targets[i, p] = unk_id
                 else:
-                    idx = int(
-                        torch.randint(
-                            len(valid_ids), (1,), generator=gen, device=targets.device
-                        ).item()
-                    )
-                    new_id = valid_ids[idx]
-                    if new_id == targets[i, p].item() and len(valid_ids) > 1:
-                        new_id = valid_ids[(idx + 1) % len(valid_ids)]
-                    targets[i, p] = new_id
+                    current = targets[i, p].item()
+                    candidates = [v for v in valid_ids if v != current]
+                    if candidates:
+                        idx = int(
+                            torch.randint(
+                                len(candidates), (1,), generator=gen, device=targets.device
+                            ).item()
+                        )
+                        targets[i, p] = candidates[idx]
         for i in range(B):
             valid_len = int(target_lengths[i].item())
             if valid_len > 0:
@@ -409,7 +411,7 @@ def load_librispeech(
     batch_size=32,
     eval_batch_size=None,
     num_workers=8,
-    eval_num_workers=0,
+    eval_num_workers=2,
     val_max_size=None,
     seed=0,
     max_train_samples=None,
@@ -536,7 +538,7 @@ def load_librispeech(
 
             train_ds = train_ds.map(_corrupt_fn, with_indices=True)
             if save_disk:
-                corrupted_save = [train_ds[i]["targets"] for i in range(len(train_ds))]
+                corrupted_save = train_ds["targets"]
                 save_static_noise_cache(
                     path,
                     corrupted_save,
@@ -585,7 +587,8 @@ def load_librispeech(
                 save_path=path,
             )
 
-    collate_fn = CollateCTC(
+    # train collate: includes runtime label noise (if configured)
+    train_collate_fn = CollateCTC(
         pad_id=blank_id,
         cmvn_mode=cmvn_mode,
         global_stats=global_stats,
@@ -597,6 +600,15 @@ def load_librispeech(
         vocab_size=vocab_size,
         unk_id=unk_id,
     )
+    # eval collate: no runtime noise — val/test/train_eval must use clean labels
+    eval_collate_fn = CollateCTC(
+        pad_id=blank_id,
+        cmvn_mode=cmvn_mode,
+        global_stats=global_stats,
+        eps=cmvn_eps,
+        vocab_size=vocab_size,
+        unk_id=unk_id,
+    )
     g = torch.Generator()
     g.manual_seed(seed)
     train_dl = DataLoader(
@@ -604,7 +616,7 @@ def load_librispeech(
         batch_size=batch_size,
         shuffle=True,
         generator=g,
-        collate_fn=collate_fn,
+        collate_fn=train_collate_fn,
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=(num_workers > 0),
@@ -614,7 +626,7 @@ def load_librispeech(
         val_ds,
         batch_size=eval_batch_size,
         shuffle=False,
-        collate_fn=collate_fn,
+        collate_fn=eval_collate_fn,
         num_workers=eval_num_workers,
         pin_memory=(eval_num_workers > 0),
         persistent_workers=(eval_num_workers > 0),
@@ -623,7 +635,7 @@ def load_librispeech(
         test_ds,
         batch_size=eval_batch_size,
         shuffle=False,
-        collate_fn=collate_fn,
+        collate_fn=eval_collate_fn,
         num_workers=eval_num_workers,
         pin_memory=(eval_num_workers > 0),
         persistent_workers=(eval_num_workers > 0),
@@ -634,7 +646,7 @@ def load_librispeech(
         train_eval_ds,
         batch_size=eval_batch_size,
         shuffle=False,
-        collate_fn=collate_fn,
+        collate_fn=eval_collate_fn,
         num_workers=eval_num_workers,
         pin_memory=(eval_num_workers > 0),
         persistent_workers=(eval_num_workers > 0),

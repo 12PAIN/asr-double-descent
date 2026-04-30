@@ -116,7 +116,11 @@ def main():
             )
             vocab_size = sp.get_piece_size()
 
-            model, step_logs = run_training(
+            run_output_dir = os.path.join(
+                os.path.splitext(args.output)[0], run_id
+            ) if train_kw.get("save_predictions", False) else None
+
+            model, epoch_logs = run_training(
                 model_config=model_config,
                 train_config=train_kw,
                 train_dl=train_dl,
@@ -133,6 +137,7 @@ def main():
                 if train_kw.get("include_val_in_train", False)
                 else val_dl,
                 n_train=len(train_dl.dataset) if hasattr(train_dl, "dataset") else 0,
+                output_dir=run_output_dir,
             )
 
             run_record = {
@@ -141,7 +146,7 @@ def main():
                 "model_config": model_config,
                 "n_params": count_parameters(model),
                 "train_config": train_kw,
-                "steps": step_logs,
+                "epochs": epoch_logs,
             }
             results.append(run_record)
             save_results(args.output, results)
