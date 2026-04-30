@@ -78,7 +78,7 @@
     }
   ],
   "train": {
-    "max_epochs": 30,
+    "max_epochs": 25,
     "eval_every_epochs": 1,
     "scheduler": "warmup_cosine",
     "batch_size": 16,
