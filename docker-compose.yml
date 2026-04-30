@@ -19,5 +19,6 @@ services:
       - ./configs:/workspace/configs:ro
       - ./outputs:/workspace/outputs
       - ./spm_unigram.model:/workspace/spm_unigram.model:ro
+      - ./spm_unigram.vocab:/workspace/spm_unigram.vocab:ro
       - ~/.cache/huggingface:/cache/huggingface
     working_dir: /workspace
